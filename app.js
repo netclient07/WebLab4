@@ -1,0 +1,1 @@
+console.log("Weather app layout initialized");
