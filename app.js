@@ -1,8 +1,12 @@
+const MAX_EXTRA_CITIES = 10;
+
 const state = {
   baseLocation: null,
   extraLocations: [],
   activeLocationId: null,
-  weatherByLocation: {}
+  weatherByLocation: {},
+  selectedSuggestion: null,
+  suggestionAbortController: null
 };
 
 const refs = {
@@ -29,19 +33,46 @@ const weatherCodeMap = {
   51: "Слабая морось",
   53: "Морось",
   55: "Сильная морось",
+  56: "Слабая ледяная морось",
+  57: "Ледяная морось",
   61: "Слабый дождь",
   63: "Дождь",
   65: "Сильный дождь",
+  66: "Слабый ледяной дождь",
+  67: "Ледяной дождь",
   71: "Слабый снег",
   73: "Снег",
   75: "Сильный снег",
+  77: "Снежные зерна",
   80: "Ливни",
   81: "Сильные ливни",
   82: "Очень сильные ливни",
+  85: "Слабый снегопад",
+  86: "Сильный снегопад",
   95: "Гроза",
   96: "Гроза с градом",
   99: "Сильная гроза с градом"
 };
+
+function debounce(fn, delay = 300) {
+  let timer = null;
+  return (...args) => {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(() => fn(...args), delay);
+  };
+}
+
+function safeJsonParse(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    return null;
+  }
+}
+
+function normalizeCityName(value) {
+  return value.trim().toLowerCase();
+}
 
 function getAllLocations() {
   const locations = [];
@@ -53,6 +84,17 @@ function getAllLocations() {
 
 function findLocationById(locationId) {
   return getAllLocations().find((location) => location.id === locationId) || null;
+}
+
+function makeCityLabel(city) {
+  const parts = [city.name];
+  if (city.admin1) {
+    parts.push(city.admin1);
+  }
+  if (city.country) {
+    parts.push(city.country);
+  }
+  return parts.join(", ");
 }
 
 function capitalize(value) {
@@ -80,6 +122,16 @@ function formatDayLabel(isoDate, dayIndex) {
   };
 }
 
+function hideCityError() {
+  refs.cityError.textContent = "";
+  refs.cityError.classList.add("hidden");
+}
+
+function showCityError(message) {
+  refs.cityError.textContent = message;
+  refs.cityError.classList.remove("hidden");
+}
+
 function showGlobalStatus(message) {
   refs.globalStatus.textContent = message || "";
 }
@@ -93,10 +145,57 @@ function setForecastState(text, isError = false) {
 
 function renderBaseLocationHint() {
   if (state.baseLocation) {
-    refs.baseLocationHint.textContent = "Базовая локация определена. Можно обновить прогноз.";
+    refs.baseLocationHint.textContent = "Добавляйте города и переключайтесь между локациями.";
   } else {
-    refs.baseLocationHint.textContent = "Геолокация недоступна. Базовая локация пока не выбрана.";
+    refs.baseLocationHint.textContent = "Геолокация недоступна или отклонена. Можно добавить город вручную.";
   }
+}
+
+function renderSuggestions(items, options = {}) {
+  refs.suggestions.innerHTML = "";
+
+  if (options.infoMessage) {
+    const info = document.createElement("div");
+    info.className = "suggestion-item is-info";
+    info.textContent = options.infoMessage;
+    refs.suggestions.appendChild(info);
+    refs.suggestions.classList.remove("hidden");
+    return;
+  }
+
+  if (!items.length) {
+    refs.suggestions.classList.add("hidden");
+    return;
+  }
+
+  items.forEach((item) => {
+    const option = document.createElement("button");
+    option.type = "button";
+    option.className = "suggestion-item";
+    option.textContent = item.displayName;
+    option.dataset.cityPayload = JSON.stringify(item);
+    option.addEventListener("click", onSuggestionClick);
+    refs.suggestions.appendChild(option);
+  });
+
+  refs.suggestions.classList.remove("hidden");
+}
+
+function hideSuggestions() {
+  refs.suggestions.classList.add("hidden");
+  refs.suggestions.innerHTML = "";
+}
+
+function hasDuplicateLocation(candidate) {
+  const normalizedCandidate = normalizeCityName(candidate.name);
+
+  return getAllLocations().some((location) => {
+    const sameCoords =
+      Math.abs(location.latitude - candidate.latitude) < 0.001 &&
+      Math.abs(location.longitude - candidate.longitude) < 0.001;
+    const sameName = normalizeCityName(location.name) === normalizedCandidate;
+    return sameCoords || sameName;
+  });
 }
 
 function renderLocationList() {
@@ -138,6 +237,11 @@ function renderLocationList() {
       state.activeLocationId = location.id;
       renderLocationList();
       renderActiveForecast();
+
+      const weatherStateCurrent = state.weatherByLocation[location.id];
+      if (!weatherStateCurrent || weatherStateCurrent.status === "idle") {
+        fetchWeatherForLocation(location);
+      }
     });
 
     row.appendChild(switchButton);
@@ -293,6 +397,159 @@ async function refreshWeatherForAllLocations() {
   }
 }
 
+function cityToLocation(city, asBase = false) {
+  const basePayload = {
+    name: asBase ? city.baseTitle || city.name : city.name,
+    latitude: city.latitude,
+    longitude: city.longitude
+  };
+
+  if (asBase) {
+    return {
+      ...basePayload,
+      id: "base",
+      type: "base"
+    };
+  }
+
+  return {
+    ...basePayload,
+    id: `extra-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    type: "extra"
+  };
+}
+
+function resetCityInput() {
+  refs.cityInput.value = "";
+  state.selectedSuggestion = null;
+  hideSuggestions();
+}
+
+function addCityFromSelection() {
+  const city = state.selectedSuggestion;
+
+  if (!city) {
+    showCityError("Выберите город из выпадающего списка.");
+    return;
+  }
+
+  hideCityError();
+
+  const candidate = {
+    name: city.name,
+    latitude: city.latitude,
+    longitude: city.longitude
+  };
+
+  if (hasDuplicateLocation(candidate)) {
+    showCityError("Этот город уже добавлен.");
+    return;
+  }
+
+  if (!state.baseLocation) {
+    state.baseLocation = cityToLocation({ ...city, baseTitle: makeCityLabel(city) }, true);
+    state.activeLocationId = state.baseLocation.id;
+    state.weatherByLocation.base = { status: "idle" };
+  } else {
+    if (state.extraLocations.length >= MAX_EXTRA_CITIES) {
+      showCityError(`Можно добавить максимум ${MAX_EXTRA_CITIES} дополнительных городов.`);
+      return;
+    }
+
+    const newLocation = cityToLocation(city, false);
+    state.extraLocations.push(newLocation);
+    state.activeLocationId = newLocation.id;
+    state.weatherByLocation[newLocation.id] = { status: "idle" };
+  }
+
+  resetCityInput();
+  renderBaseLocationHint();
+  renderLocationList();
+  renderActiveForecast();
+  fetchWeatherForLocation(findLocationById(state.activeLocationId), true);
+}
+
+async function fetchCitySuggestions(query) {
+  if (state.suggestionAbortController) {
+    state.suggestionAbortController.abort();
+  }
+
+  state.suggestionAbortController = new AbortController();
+
+  const endpoint = new URL("https://geocoding-api.open-meteo.com/v1/search");
+  endpoint.searchParams.set("name", query);
+  endpoint.searchParams.set("count", "6");
+  endpoint.searchParams.set("language", "ru");
+  endpoint.searchParams.set("format", "json");
+
+  const response = await fetch(endpoint.toString(), {
+    signal: state.suggestionAbortController.signal
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const payload = await response.json();
+  const results = Array.isArray(payload.results) ? payload.results : [];
+
+  return results.map((item) => ({
+    name: item.name,
+    latitude: item.latitude,
+    longitude: item.longitude,
+    country: item.country || "",
+    admin1: item.admin1 || "",
+    displayName: makeCityLabel(item)
+  }));
+}
+
+const handleCityInput = debounce(async () => {
+  const query = refs.cityInput.value.trim();
+  state.selectedSuggestion = null;
+  hideCityError();
+
+  if (query.length < 2) {
+    hideSuggestions();
+    return;
+  }
+
+  renderSuggestions([], { infoMessage: "Поиск..." });
+
+  try {
+    const suggestions = await fetchCitySuggestions(query);
+
+    if (!suggestions.length) {
+      renderSuggestions([], { infoMessage: "Город не найден" });
+      return;
+    }
+
+    renderSuggestions(suggestions);
+  } catch (error) {
+    if (error.name === "AbortError") {
+      return;
+    }
+
+    renderSuggestions([], { infoMessage: "Ошибка загрузки подсказок" });
+  }
+}, 250);
+
+function onSuggestionClick(event) {
+  const payload = event.currentTarget.dataset.cityPayload;
+  if (!payload) {
+    return;
+  }
+
+  const city = safeJsonParse(payload);
+  if (!city) {
+    return;
+  }
+
+  state.selectedSuggestion = city;
+  refs.cityInput.value = city.displayName;
+  hideCityError();
+  hideSuggestions();
+}
+
 function geolocationToBaseLocation(position) {
   return {
     id: "base",
@@ -306,7 +563,7 @@ function geolocationToBaseLocation(position) {
 function tryInitializeWithGeolocation() {
   if (!navigator.geolocation) {
     renderBaseLocationHint();
-    setForecastState("Геолокация не поддерживается браузером.");
+    setForecastState("Геолокация не поддерживается браузером. Добавьте город вручную.");
     return;
   }
 
@@ -315,6 +572,10 @@ function tryInitializeWithGeolocation() {
 
   navigator.geolocation.getCurrentPosition(
     (position) => {
+      if (state.baseLocation) {
+        return;
+      }
+
       state.baseLocation = geolocationToBaseLocation(position);
       state.activeLocationId = "base";
       state.weatherByLocation.base = { status: "idle" };
@@ -327,7 +588,7 @@ function tryInitializeWithGeolocation() {
     () => {
       showGlobalStatus("Доступ к геолокации отклонен.");
       renderBaseLocationHint();
-      setForecastState("Доступ к геолокации отклонен. Позже можно будет выбрать город вручную.");
+      setForecastState("Доступ к геолокации отклонен. Выберите город вручную.");
     },
     { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
   );
@@ -335,11 +596,17 @@ function tryInitializeWithGeolocation() {
 
 function initializeEventHandlers() {
   refs.refreshBtn.addEventListener("click", refreshWeatherForAllLocations);
+  refs.cityInput.addEventListener("input", handleCityInput);
 
   refs.addCityForm.addEventListener("submit", (event) => {
     event.preventDefault();
-    refs.cityError.textContent = "Ручное добавление города будет реализовано в следующем коммите.";
-    refs.cityError.classList.remove("hidden");
+    addCityFromSelection();
+  });
+
+  document.addEventListener("click", (event) => {
+    if (!refs.suggestions.contains(event.target) && event.target !== refs.cityInput) {
+      hideSuggestions();
+    }
   });
 }
 
