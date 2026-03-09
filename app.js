@@ -1,28 +1,8 @@
 const state = {
-  baseLocation: {
-    id: "base",
-    type: "base",
-    name: "Санкт-Петербург",
-    latitude: 59.93,
-    longitude: 30.31
-  },
+  baseLocation: null,
   extraLocations: [],
-  activeLocationId: "base",
-  weatherByLocation: {
-    base: {
-      status: "success",
-      data: {
-        daily: {
-          time: ["2026-03-09", "2026-03-10", "2026-03-11"],
-          temperature_2m_max: [3, 4, 2],
-          temperature_2m_min: [-2, 0, -1],
-          precipitation_probability_max: [20, 35, 40],
-          wind_speed_10m_max: [16, 18, 12],
-          weather_code: [3, 61, 45]
-        }
-      }
-    }
-  }
+  activeLocationId: null,
+  weatherByLocation: {}
 };
 
 const refs = {
@@ -45,12 +25,22 @@ const weatherCodeMap = {
   2: "Переменная облачность",
   3: "Пасмурно",
   45: "Туман",
+  48: "Изморозь",
+  51: "Слабая морось",
+  53: "Морось",
+  55: "Сильная морось",
   61: "Слабый дождь",
   63: "Дождь",
+  65: "Сильный дождь",
   71: "Слабый снег",
   73: "Снег",
+  75: "Сильный снег",
   80: "Ливни",
-  95: "Гроза"
+  81: "Сильные ливни",
+  82: "Очень сильные ливни",
+  95: "Гроза",
+  96: "Гроза с градом",
+  99: "Сильная гроза с градом"
 };
 
 function getAllLocations() {
@@ -90,6 +80,10 @@ function formatDayLabel(isoDate, dayIndex) {
   };
 }
 
+function showGlobalStatus(message) {
+  refs.globalStatus.textContent = message || "";
+}
+
 function setForecastState(text, isError = false) {
   refs.forecastState.textContent = text;
   refs.forecastState.classList.toggle("is-error", isError);
@@ -99,9 +93,9 @@ function setForecastState(text, isError = false) {
 
 function renderBaseLocationHint() {
   if (state.baseLocation) {
-    refs.baseLocationHint.textContent = "Можно добавить дополнительные города и переключаться между ними.";
+    refs.baseLocationHint.textContent = "Базовая локация определена. Можно обновить прогноз.";
   } else {
-    refs.baseLocationHint.textContent = "Основная локация пока не определена.";
+    refs.baseLocationHint.textContent = "Геолокация недоступна. Базовая локация пока не выбрана.";
   }
 }
 
@@ -194,9 +188,9 @@ function renderActiveForecast() {
     return;
   }
 
-  const weatherState = state.weatherByLocation[location.id];
   refs.activeLocationTitle.textContent = location.name;
 
+  const weatherState = state.weatherByLocation[location.id];
   if (!weatherState || weatherState.status === "idle") {
     setForecastState("Данные еще не загружены.");
     return;
@@ -215,14 +209,136 @@ function renderActiveForecast() {
   renderForecastCards(location, weatherState.data);
 }
 
+async function fetchWeatherForLocation(location, force = false) {
+  const current = state.weatherByLocation[location.id];
+
+  if (!force && current && current.status === "loading") {
+    return;
+  }
+
+  state.weatherByLocation[location.id] = { status: "loading" };
+  renderLocationList();
+
+  if (location.id === state.activeLocationId) {
+    renderActiveForecast();
+  }
+
+  try {
+    const endpoint = new URL("https://api.open-meteo.com/v1/forecast");
+    endpoint.searchParams.set("latitude", String(location.latitude));
+    endpoint.searchParams.set("longitude", String(location.longitude));
+    endpoint.searchParams.set(
+      "daily",
+      "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max"
+    );
+    endpoint.searchParams.set("forecast_days", "3");
+    endpoint.searchParams.set("timezone", "auto");
+
+    const response = await fetch(endpoint.toString());
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const payload = await response.json();
+    const isValid =
+      payload &&
+      payload.daily &&
+      Array.isArray(payload.daily.time) &&
+      payload.daily.time.length >= 3;
+
+    if (!isValid) {
+      throw new Error("Некорректный формат данных от погодного сервиса.");
+    }
+
+    state.weatherByLocation[location.id] = {
+      status: "success",
+      data: payload
+    };
+  } catch (error) {
+    state.weatherByLocation[location.id] = {
+      status: "error",
+      message: "Ошибка загрузки прогноза. Попробуйте позже."
+    };
+  }
+
+  renderLocationList();
+
+  if (location.id === state.activeLocationId) {
+    renderActiveForecast();
+  }
+}
+
+async function refreshWeatherForAllLocations() {
+  const locations = getAllLocations();
+
+  if (!locations.length) {
+    showGlobalStatus("Нет локаций для обновления.");
+    return;
+  }
+
+  showGlobalStatus("Обновление...");
+  await Promise.all(locations.map((location) => fetchWeatherForLocation(location, true)));
+
+  const hasErrors = locations.some((location) => state.weatherByLocation[location.id]?.status === "error");
+
+  if (hasErrors) {
+    showGlobalStatus("Обновление завершено с ошибками.");
+  } else {
+    showGlobalStatus(
+      `Обновлено: ${new Date().toLocaleTimeString("ru-RU", {
+        hour: "2-digit",
+        minute: "2-digit"
+      })}`
+    );
+  }
+}
+
+function geolocationToBaseLocation(position) {
+  return {
+    id: "base",
+    type: "base",
+    name: "Текущее местоположение",
+    latitude: Number(position.coords.latitude.toFixed(4)),
+    longitude: Number(position.coords.longitude.toFixed(4))
+  };
+}
+
+function tryInitializeWithGeolocation() {
+  if (!navigator.geolocation) {
+    renderBaseLocationHint();
+    setForecastState("Геолокация не поддерживается браузером.");
+    return;
+  }
+
+  setForecastState("Запрашиваем доступ к геолокации...");
+  showGlobalStatus("Ожидаем разрешение геолокации...");
+
+  navigator.geolocation.getCurrentPosition(
+    (position) => {
+      state.baseLocation = geolocationToBaseLocation(position);
+      state.activeLocationId = "base";
+      state.weatherByLocation.base = { status: "idle" };
+
+      showGlobalStatus("Геолокация получена.");
+      renderBaseLocationHint();
+      renderLocationList();
+      fetchWeatherForLocation(state.baseLocation, true);
+    },
+    () => {
+      showGlobalStatus("Доступ к геолокации отклонен.");
+      renderBaseLocationHint();
+      setForecastState("Доступ к геолокации отклонен. Позже можно будет выбрать город вручную.");
+    },
+    { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
+  );
+}
+
 function initializeEventHandlers() {
-  refs.refreshBtn.addEventListener("click", () => {
-    refs.globalStatus.textContent = "Обновление пока не реализовано";
-  });
+  refs.refreshBtn.addEventListener("click", refreshWeatherForAllLocations);
 
   refs.addCityForm.addEventListener("submit", (event) => {
     event.preventDefault();
-    refs.cityError.textContent = "Добавление города будет реализовано в следующем коммите.";
+    refs.cityError.textContent = "Ручное добавление города будет реализовано в следующем коммите.";
     refs.cityError.classList.remove("hidden");
   });
 }
@@ -232,6 +348,7 @@ function initializeApp() {
   renderLocationList();
   renderActiveForecast();
   initializeEventHandlers();
+  tryInitializeWithGeolocation();
 }
 
 initializeApp();
