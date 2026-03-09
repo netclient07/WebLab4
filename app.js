@@ -1,3 +1,4 @@
+const STORAGE_KEY = "weather_app_state_v1";
 const MAX_EXTRA_CITIES = 10;
 
 const state = {
@@ -74,6 +75,40 @@ function normalizeCityName(value) {
   return value.trim().toLowerCase();
 }
 
+function saveState() {
+  const payload = {
+    baseLocation: state.baseLocation,
+    extraLocations: state.extraLocations,
+    activeLocationId: state.activeLocationId
+  };
+
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+}
+
+function restoreState() {
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (!raw) {
+    return;
+  }
+
+  const parsed = safeJsonParse(raw);
+  if (!parsed || typeof parsed !== "object") {
+    return;
+  }
+
+  if (parsed.baseLocation && typeof parsed.baseLocation === "object") {
+    state.baseLocation = parsed.baseLocation;
+  }
+
+  if (Array.isArray(parsed.extraLocations)) {
+    state.extraLocations = parsed.extraLocations.filter((item) => item && typeof item === "object");
+  }
+
+  if (typeof parsed.activeLocationId === "string") {
+    state.activeLocationId = parsed.activeLocationId;
+  }
+}
+
 function getAllLocations() {
   const locations = [];
   if (state.baseLocation) {
@@ -95,13 +130,6 @@ function makeCityLabel(city) {
     parts.push(city.country);
   }
   return parts.join(", ");
-}
-
-function capitalize(value) {
-  if (!value) {
-    return "";
-  }
-  return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 function formatDayLabel(isoDate, dayIndex) {
@@ -136,18 +164,11 @@ function showGlobalStatus(message) {
   refs.globalStatus.textContent = message || "";
 }
 
-function setForecastState(text, isError = false) {
-  refs.forecastState.textContent = text;
-  refs.forecastState.classList.toggle("is-error", isError);
-  refs.forecastState.classList.remove("hidden");
-  refs.forecastGrid.classList.add("hidden");
-}
-
 function renderBaseLocationHint() {
   if (state.baseLocation) {
     refs.baseLocationHint.textContent = "Добавляйте города и переключайтесь между локациями.";
   } else {
-    refs.baseLocationHint.textContent = "Геолокация недоступна или отклонена. Можно добавить город вручную.";
+    refs.baseLocationHint.textContent = "Геолокация недоступна или отклонена. Сначала добавьте основной город.";
   }
 }
 
@@ -234,25 +255,35 @@ function renderLocationList() {
     switchButton.className = "location-main";
     switchButton.innerHTML = `<strong>${location.name}</strong><span>${shortStatus}</span>`;
     switchButton.addEventListener("click", () => {
-      state.activeLocationId = location.id;
-      renderLocationList();
-      renderActiveForecast();
-
-      const weatherStateCurrent = state.weatherByLocation[location.id];
-      if (!weatherStateCurrent || weatherStateCurrent.status === "idle") {
-        fetchWeatherForLocation(location);
-      }
+      setActiveLocation(location.id);
     });
 
     row.appendChild(switchButton);
+
+    if (location.type !== "base") {
+      const removeButton = document.createElement("button");
+      removeButton.type = "button";
+      removeButton.className = "location-remove";
+      removeButton.title = "Удалить город";
+      removeButton.textContent = "×";
+      removeButton.addEventListener("click", () => removeExtraLocation(location.id));
+      row.appendChild(removeButton);
+    }
+
     refs.locationList.appendChild(row);
   });
+}
+
+function setForecastState(text, isError = false) {
+  refs.forecastState.textContent = text;
+  refs.forecastState.classList.toggle("is-error", isError);
+  refs.forecastState.classList.remove("hidden");
+  refs.forecastGrid.classList.add("hidden");
 }
 
 function renderForecastCards(location, weatherData) {
   refs.activeLocationTitle.textContent = location.name;
   refs.forecastGrid.innerHTML = "";
-
   const days = weatherData.daily.time.slice(0, 3);
 
   days.forEach((isoDate, dayIndex) => {
@@ -293,8 +324,8 @@ function renderActiveForecast() {
   }
 
   refs.activeLocationTitle.textContent = location.name;
-
   const weatherState = state.weatherByLocation[location.id];
+
   if (!weatherState || weatherState.status === "idle") {
     setForecastState("Данные еще не загружены.");
     return;
@@ -313,9 +344,15 @@ function renderActiveForecast() {
   renderForecastCards(location, weatherState.data);
 }
 
+function capitalize(value) {
+  if (!value) {
+    return "";
+  }
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
 async function fetchWeatherForLocation(location, force = false) {
   const current = state.weatherByLocation[location.id];
-
   if (!force && current && current.status === "loading") {
     return;
   }
@@ -342,7 +379,6 @@ async function fetchWeatherForLocation(location, force = false) {
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
-
     const payload = await response.json();
     const isValid =
       payload &&
@@ -354,10 +390,7 @@ async function fetchWeatherForLocation(location, force = false) {
       throw new Error("Некорректный формат данных от погодного сервиса.");
     }
 
-    state.weatherByLocation[location.id] = {
-      status: "success",
-      data: payload
-    };
+    state.weatherByLocation[location.id] = { status: "success", data: payload };
   } catch (error) {
     state.weatherByLocation[location.id] = {
       status: "error",
@@ -374,7 +407,6 @@ async function fetchWeatherForLocation(location, force = false) {
 
 async function refreshWeatherForAllLocations() {
   const locations = getAllLocations();
-
   if (!locations.length) {
     showGlobalStatus("Нет локаций для обновления.");
     return;
@@ -384,17 +416,44 @@ async function refreshWeatherForAllLocations() {
   await Promise.all(locations.map((location) => fetchWeatherForLocation(location, true)));
 
   const hasErrors = locations.some((location) => state.weatherByLocation[location.id]?.status === "error");
-
   if (hasErrors) {
     showGlobalStatus("Обновление завершено с ошибками.");
   } else {
-    showGlobalStatus(
-      `Обновлено: ${new Date().toLocaleTimeString("ru-RU", {
-        hour: "2-digit",
-        minute: "2-digit"
-      })}`
-    );
+    showGlobalStatus(`Обновлено: ${new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}`);
   }
+}
+
+function setActiveLocation(locationId) {
+  const location = findLocationById(locationId);
+  if (!location) {
+    return;
+  }
+
+  state.activeLocationId = locationId;
+  saveState();
+  renderLocationList();
+  renderActiveForecast();
+
+  const weatherState = state.weatherByLocation[locationId];
+  if (!weatherState || weatherState.status === "idle") {
+    fetchWeatherForLocation(location);
+  }
+}
+
+function removeExtraLocation(locationId) {
+  state.extraLocations = state.extraLocations.filter((item) => item.id !== locationId);
+  delete state.weatherByLocation[locationId];
+
+  const locations = getAllLocations();
+  if (!locations.length) {
+    state.activeLocationId = null;
+  } else if (!findLocationById(state.activeLocationId)) {
+    state.activeLocationId = locations[0].id;
+  }
+
+  saveState();
+  renderLocationList();
+  renderActiveForecast();
 }
 
 function cityToLocation(city, asBase = false) {
@@ -427,14 +486,12 @@ function resetCityInput() {
 
 function addCityFromSelection() {
   const city = state.selectedSuggestion;
-
   if (!city) {
     showCityError("Выберите город из выпадающего списка.");
     return;
   }
 
   hideCityError();
-
   const candidate = {
     name: city.name,
     latitude: city.latitude,
@@ -449,19 +506,17 @@ function addCityFromSelection() {
   if (!state.baseLocation) {
     state.baseLocation = cityToLocation({ ...city, baseTitle: makeCityLabel(city) }, true);
     state.activeLocationId = state.baseLocation.id;
-    state.weatherByLocation.base = { status: "idle" };
   } else {
     if (state.extraLocations.length >= MAX_EXTRA_CITIES) {
       showCityError(`Можно добавить максимум ${MAX_EXTRA_CITIES} дополнительных городов.`);
       return;
     }
-
     const newLocation = cityToLocation(city, false);
     state.extraLocations.push(newLocation);
     state.activeLocationId = newLocation.id;
-    state.weatherByLocation[newLocation.id] = { status: "idle" };
   }
 
+  saveState();
   resetCityInput();
   renderBaseLocationHint();
   renderLocationList();
@@ -473,7 +528,6 @@ async function fetchCitySuggestions(query) {
   if (state.suggestionAbortController) {
     state.suggestionAbortController.abort();
   }
-
   state.suggestionAbortController = new AbortController();
 
   const endpoint = new URL("https://geocoding-api.open-meteo.com/v1/search");
@@ -482,10 +536,7 @@ async function fetchCitySuggestions(query) {
   endpoint.searchParams.set("language", "ru");
   endpoint.searchParams.set("format", "json");
 
-  const response = await fetch(endpoint.toString(), {
-    signal: state.suggestionAbortController.signal
-  });
-
+  const response = await fetch(endpoint.toString(), { signal: state.suggestionAbortController.signal });
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}`);
   }
@@ -514,21 +565,17 @@ const handleCityInput = debounce(async () => {
   }
 
   renderSuggestions([], { infoMessage: "Поиск..." });
-
   try {
     const suggestions = await fetchCitySuggestions(query);
-
     if (!suggestions.length) {
       renderSuggestions([], { infoMessage: "Город не найден" });
       return;
     }
-
     renderSuggestions(suggestions);
   } catch (error) {
     if (error.name === "AbortError") {
       return;
     }
-
     renderSuggestions([], { infoMessage: "Ошибка загрузки подсказок" });
   }
 }, 250);
@@ -550,6 +597,21 @@ function onSuggestionClick(event) {
   hideSuggestions();
 }
 
+function initializeEventHandlers() {
+  refs.refreshBtn.addEventListener("click", refreshWeatherForAllLocations);
+  refs.cityInput.addEventListener("input", handleCityInput);
+  refs.addCityForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    addCityFromSelection();
+  });
+
+  document.addEventListener("click", (event) => {
+    if (!refs.suggestions.contains(event.target) && event.target !== refs.cityInput) {
+      hideSuggestions();
+    }
+  });
+}
+
 function geolocationToBaseLocation(position) {
   return {
     id: "base",
@@ -560,7 +622,7 @@ function geolocationToBaseLocation(position) {
   };
 }
 
-function tryInitializeWithGeolocation() {
+async function tryInitializeWithGeolocation() {
   if (!navigator.geolocation) {
     renderBaseLocationHint();
     setForecastState("Геолокация не поддерживается браузером. Добавьте город вручную.");
@@ -572,14 +634,9 @@ function tryInitializeWithGeolocation() {
 
   navigator.geolocation.getCurrentPosition(
     (position) => {
-      if (state.baseLocation) {
-        return;
-      }
-
       state.baseLocation = geolocationToBaseLocation(position);
       state.activeLocationId = "base";
-      state.weatherByLocation.base = { status: "idle" };
-
+      saveState();
       showGlobalStatus("Геолокация получена.");
       renderBaseLocationHint();
       renderLocationList();
@@ -594,28 +651,42 @@ function tryInitializeWithGeolocation() {
   );
 }
 
-function initializeEventHandlers() {
-  refs.refreshBtn.addEventListener("click", refreshWeatherForAllLocations);
-  refs.cityInput.addEventListener("input", handleCityInput);
-
-  refs.addCityForm.addEventListener("submit", (event) => {
-    event.preventDefault();
-    addCityFromSelection();
-  });
-
-  document.addEventListener("click", (event) => {
-    if (!refs.suggestions.contains(event.target) && event.target !== refs.cityInput) {
-      hideSuggestions();
+function hydrateWeatherStateForRestoredLocations() {
+  getAllLocations().forEach((location) => {
+    if (!state.weatherByLocation[location.id]) {
+      state.weatherByLocation[location.id] = { status: "idle" };
     }
   });
 }
 
-function initializeApp() {
+function ensureValidActiveLocation() {
+  const locations = getAllLocations();
+  if (!locations.length) {
+    state.activeLocationId = null;
+    return;
+  }
+
+  const exists = locations.some((location) => location.id === state.activeLocationId);
+  if (!exists) {
+    state.activeLocationId = locations[0].id;
+  }
+}
+
+async function initializeApp() {
+  restoreState();
+  ensureValidActiveLocation();
+  hydrateWeatherStateForRestoredLocations();
   renderBaseLocationHint();
   renderLocationList();
   renderActiveForecast();
   initializeEventHandlers();
-  tryInitializeWithGeolocation();
+
+  if (!state.baseLocation) {
+    await tryInitializeWithGeolocation();
+    return;
+  }
+
+  refreshWeatherForAllLocations();
 }
 
 initializeApp();
